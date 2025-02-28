@@ -1,0 +1,155 @@
+import os
+import time
+import csv
+import re
+from z3 import Context
+from create_requirements import generate_requirements_txt, read_solution_file
+from dependency import fetch_direct_dependencies, fetch_transitive_dependencies, fetch_transitive_dependencies_with_depth
+from read import read_json_file, read_test_requirements
+from requirements import parse_requirements
+from smt import generate_smt_expression, smt_solver
+
+def main():
+    """
+    Main function to execute the dependency resolution process for multiple requirements.txt files across folders.
+    It reads the projects_data file once and logs execution time into a single file for all requirements.
+    """
+    base_directory = "datasets_evaluation/mytool_pip_smartPip_result_data/Datasets_Used/jupyterNotebook"
+    projects_data_file = "example"
+    log_directory = "evaluation_result"
+    log_file = os.path.join(log_directory, "SMTpip_jupyterNotebook.txt")
+    output_csv_path = os.path.join(log_directory, "SMTpip_jupyterNotebook.csv")
+
+    def log_execution_time(action_name, folder_name, start_time, end_time):
+        """
+        Log the execution time of a specific action to a log file.
+        """
+        with open(log_file, "a") as file:
+            file.write(
+                f"{action_name} for {folder_name} execution time: {end_time - start_time} seconds\n"
+            )
+
+    def log_error(folder_name, error_message):
+        """
+        Log any errors encountered during execution to the log file.
+        """
+        with open(log_file, "a") as file:
+            file.write(f"Error in folder {folder_name}: {error_message}\n")
+
+    # Read the projects_data once
+    print("Reading projects_data...")
+    try:
+        projects_data = read_json_file(projects_data_file)
+    except Exception as e:
+        print(f"Failed to read projects_data: {e}")
+        return
+
+    for folder_name in os.listdir(base_directory):
+        folder_path = os.path.join(base_directory, folder_name)
+        requirements_txt_path = os.path.join(folder_path, "requirements.txt")
+        
+        if os.path.isfile(requirements_txt_path):
+            print(f"Processing folder: {folder_name}")
+            try:
+                start_time = time.time()
+                requirements_txt = read_test_requirements(folder_path)
+                end_time = time.time()
+                log_execution_time("Reading files", folder_name, start_time, end_time)
+
+                start_time = time.time()
+                requirements = parse_requirements(requirements_txt)
+                end_time = time.time()
+                log_execution_time("Parsing requirements", folder_name, start_time, end_time)
+
+                start_time = time.time()
+                direct_dependencies = fetch_direct_dependencies(requirements, projects_data)
+                end_time = time.time()
+                log_execution_time("Fetching versions and dependencies", folder_name, start_time, end_time)
+
+                start_time = time.time()
+                transitive_dependencies = fetch_transitive_dependencies(direct_dependencies, projects_data)
+                end_time = time.time()
+                log_execution_time("Fetching transitive dependencies", folder_name, start_time, end_time)
+
+                start_time = time.time()
+                ctx = Context()
+                solver = generate_smt_expression(direct_dependencies, transitive_dependencies, ctx, add_soft_clauses=False, minimize_packages=False)
+                end_time = time.time()
+                log_execution_time("Generating SMT expression", folder_name, start_time, end_time)
+
+                solution, proof, start_time, end_time = smt_solver(solver, ctx)
+                if solution:
+                    log_execution_time("Solving SMT expression", folder_name, start_time, end_time)
+                    solution_dict = read_solution_file(os.path.join(folder_path, "string_solution.txt"))
+                    start_time = time.time()
+                    generate_requirements_txt(solution_dict, folder_path, "requirements_latest.txt")
+                    end_time = time.time()
+                    log_execution_time("Generating requirements.txt", folder_name, start_time, end_time)
+                else:
+                    with open(os.path.join(folder_path, "proof.txt"), "w") as file:
+                        file.write(proof)
+                    print(f"No solution found for folder: {folder_name}, proof saved.")
+
+            except Exception as e:
+                print(f"Error processing folder {folder_name}: {e}")
+                log_error(folder_name, str(e))
+        else:
+            print(f"No requirements.txt found in folder: {folder_name}")
+
+    # Convert log file to CSV
+    convert_log_to_csv(log_file, output_csv_path)
+    print(f"CSV file generated: {output_csv_path}")
+
+def convert_log_to_csv(input_file_path, output_csv_path):
+    """
+    Converts the log file generated by the main function to a CSV format.
+    """
+    columns = [
+        "Processing folder",
+        "Reading files execution time",
+        "Parsing requirements execution time",
+        "Fetching versions and dependencies execution time",
+        "Fetching transitive dependencies execution time",
+        "Generating SMT expression execution time",
+        "Solving SMT expression execution time",
+        "Generating requirements.txt execution time",
+        "Error Message"
+    ]
+    data = [columns]
+    regex_patterns = {
+        "Processing folder": re.compile(r"Reading files for (.*?) execution time"),
+        "Reading files execution time": re.compile(r"Reading files for .*? execution time:\s*([\d.]+) seconds"),
+        "Parsing requirements execution time": re.compile(r"Parsing requirements for .*? execution time:\s*([\d.]+) seconds"),
+        "Fetching versions and dependencies execution time": re.compile(r"Fetching versions and dependencies for .*? execution time:\s*([\d.]+) seconds"),
+        "Fetching transitive dependencies execution time": re.compile(r"Fetching transitive dependencies for .*? execution time:\s*([\d.]+) seconds"),
+        "Generating SMT expression execution time": re.compile(r"Generating SMT expression for .*? execution time:\s*([\d.]+) seconds"),
+        "Solving SMT expression execution time": re.compile(r"Solving SMT expression for .*? execution time:\s*([\d.]+) seconds"),
+        "Generating requirements.txt execution time": re.compile(r"Generating requirements.txt for .*? execution time:\s*([\d.]+) seconds"),
+        "Error Message": re.compile(r"Error in folder .*?:\s*(.*)")
+    }
+
+    def parse_block(block):
+        row = []
+        solving_smt_match = regex_patterns["Solving SMT expression execution time"].search(block)
+        if solving_smt_match:
+            for column in columns:
+                match = regex_patterns[column].search(block)
+                row.append(match.group(1) if match else "")
+            return row
+        return None
+
+    with open(input_file_path, 'r') as file:
+        content = file.read()
+        blocks = content.split("Reading files for")
+        for block in blocks[1:]:
+            block = "Reading files for" + block
+            row = parse_block(block)
+            if row:
+                data.append(row)
+
+    with open(output_csv_path, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerows(data)
+
+if __name__ == "__main__":
+    main()
